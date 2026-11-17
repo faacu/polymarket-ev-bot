@@ -1,0 +1,48 @@
+2026-11-17 08:30:47,626 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:30:47,627 [WARNING] PaperWallet.buy: insufficient USDT (have $1000.00, need $1500.00). Capping.
+2026-11-17 08:30:47,627 [INFO] [PAPER BUY]  SOL/USDT | 10.000000 crypto @ $100.0000 | spent $1000.00 | USDT left: $0.00
+2026-11-17 08:30:47,628 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:30:47,628 [WARNING] PaperWallet.buy: amount_usdt must be positive.
+2026-11-17 08:30:47,628 [WARNING] PaperWallet.buy: amount_usdt must be positive.
+2026-11-17 08:30:47,629 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:30:47,629 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:30:47,630 [INFO] [PAPER BUY]  SOL/USDT | 2.000000 crypto @ $100.0000 | spent $200.00 | USDT left: $800.00
+2026-11-17 08:30:47,631 [WARNING] PaperWallet.sell: not enough SOL/USDT (have 2.000000, need 5.000000). Capping.
+2026-11-17 08:30:47,631 [INFO] [PAPER SELL] SOL/USDT | 2.000000 crypto @ $100.0000 | received $200.00 | USDT balance: $1000.00
+2026-11-17 08:30:47,631 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:30:47,631 [INFO] [PAPER BUY]  SOL/USDT | 2.000000 crypto @ $100.0000 | spent $200.00 | USDT left: $800.00
+2026-11-17 08:30:47,632 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:30:47,632 [INFO] [PAPER BUY]  SOL/USDT | 5.000000 crypto @ $100.0000 | spent $500.00 | USDT left: $500.00
+2026-11-17 08:30:47,632 [INFO] [PAPER SELL] SOL/USDT | 2.500000 crypto @ $150.0000 | received $375.00 | USDT balance: $875.00
+2026-11-17 08:32:15,294 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:32:15,295 [WARNING] PaperWallet.buy: insufficient USDT (have $1000.00, need $1500.00). Capping.
+2026-11-17 08:32:15,295 [INFO] [PAPER BUY]  SOL/USDT | 10.000000 crypto @ $100.0000 | spent $1000.00 | USDT left: $0.00
+2026-11-17 08:32:15,296 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:32:15,296 [WARNING] PaperWallet.buy: amount_usdt must be positive.
+2026-11-17 08:32:15,296 [WARNING] PaperWallet.buy: amount_usdt must be positive.
+2026-11-17 08:32:15,296 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:32:15,296 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:32:15,297 [INFO] [PAPER BUY]  SOL/USDT | 2.000000 crypto @ $100.0000 | spent $200.00 | USDT left: $800.00
+2026-11-17 08:32:15,297 [WARNING] PaperWallet.sell: not enough SOL/USDT (have 2.000000, need 5.000000). Capping.
+2026-11-17 08:32:15,297 [INFO] [PAPER SELL] SOL/USDT | 2.000000 crypto @ $100.0000 | received $200.00 | USDT balance: $1000.00
+2026-11-17 08:32:15,297 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:32:15,297 [INFO] [PAPER BUY]  SOL/USDT | 2.000000 crypto @ $100.0000 | spent $200.00 | USDT left: $800.00
+2026-11-17 08:32:15,298 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:32:15,298 [INFO] [PAPER BUY]  SOL/USDT | 5.000000 crypto @ $100.0000 | spent $500.00 | USDT left: $500.00
+2026-11-17 08:32:15,298 [INFO] [PAPER SELL] SOL/USDT | 2.500000 crypto @ $150.0000 | received $375.00 | USDT balance: $875.00
+2026-11-17 08:33:09,790 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:33:09,792 [WARNING] PaperWallet.buy: insufficient USDT (have $1000.00, need $1500.00). Capping.
+2026-11-17 08:33:09,792 [INFO] [PAPER BUY]  SOL/USDT | 10.000000 crypto @ $100.0000 | spent $1000.00 | USDT left: $0.00
+2026-11-17 08:33:09,793 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:33:09,793 [WARNING] PaperWallet.buy: amount_usdt must be positive.
+2026-11-17 08:33:09,793 [WARNING] PaperWallet.buy: amount_usdt must be positive.
+2026-11-17 08:33:09,793 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:33:09,793 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:33:09,794 [INFO] [PAPER BUY]  SOL/USDT | 2.000000 crypto @ $100.0000 | spent $200.00 | USDT left: $800.00
+2026-11-17 08:33:09,794 [WARNING] PaperWallet.sell: not enough SOL/USDT (have 2.000000, need 5.000000). Capping.
+2026-11-17 08:33:09,794 [INFO] [PAPER SELL] SOL/USDT | 2.000000 crypto @ $100.0000 | received $200.00 | USDT balance: $1000.00
+2026-11-17 08:33:09,795 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:33:09,795 [INFO] [PAPER BUY]  SOL/USDT | 2.000000 crypto @ $100.0000 | spent $200.00 | USDT left: $800.00
+2026-11-17 08:33:09,795 [INFO] PaperWallet initialised — balance: $1000.00 USDT
+2026-11-17 08:33:09,796 [INFO] [PAPER BUY]  SOL/USDT | 5.000000 crypto @ $100.0000 | spent $500.00 | USDT left: $500.00
+2026-11-17 08:33:09,796 [INFO] [PAPER SELL] SOL/USDT | 2.500000 crypto @ $150.0000 | received $375.00 | USDT balance: $875.00
