@@ -1,8 +1,8 @@
 """
-Spot Paper Trading Bot — Hybrid Technical + Fundamental Strategy.
-Exchange: Binance Spot (public, read-only via CCXT).
-AI Brain:  Google Gemini as a Hybrid Trader (TA + news confluence).
-Wallet:    PaperWallet — fully simulated, no real orders placed.
+Algorithmic trading bot for Polymarket prediction markets.
+Strategy: Expected Value (EV) arbitrage using Bayesian probability estimation.
+AI Brain: Google Gemini as a Bayesian Analyst for market mispricing detection.
+Risk management: Fractional Kelly Criterion for position sizing.
 """
 
 import os
@@ -14,11 +14,20 @@ import json
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
-import numpy as np
 import feedparser
-import ccxt
-from google import genai
-from google.genai import types as ai_types
+try:
+	from py_clob_client.client import ClobClient
+	from py_clob_client.clob_types import ApiCreds
+except ImportError:
+	ClobClient = None  # type: ignore
+	ApiCreds = None  # type: ignore
+
+try:
+	from google import genai
+	from google.genai import types as ai_types
+except ImportError:
+	genai = None  # type: ignore
+	ai_types = None  # type: ignore
 from dotenv import load_dotenv
 from colorama import Fore, Style, init as colorama_init
 
@@ -41,263 +50,312 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-WATCHLIST: list[str] = ['BTC/USDT', 'SOL/USDT', 'ETH/USDT']
+def _parse_watchlist(raw_env: Optional[str]) -> list[str]:
+	"""Parses watchlist from JSON array or comma-separated string."""
+	if not raw_env or not raw_env.strip():
+		return []
+	raw = raw_env.strip()
+	try:
+		parsed = json.loads(raw)
+		if isinstance(parsed, list):
+			return [str(item).strip() for item in parsed if item]
+	except json.JSONDecodeError:
+		pass
+	return [item.strip() for item in raw.split(',') if item.strip()]
 
-GEMINI_MODEL         = 'gemini-2.5-flash-preview-04-17'
-CANDLE_TIMEFRAME     = '15m'       # OHLCV timeframe fed to indicators
-CANDLE_LIMIT         = 50          # Number of candles to fetch
-SMA_SHORT            = 10          # Short SMA period
-SMA_LONG             = 20          # Long SMA period
-RSI_PERIOD           = 14          # RSI lookback period
-MIN_CONFIDENCE       = 0.60        # Minimum Gemini confidence to execute a trade
-LOOP_INTERVAL_SECONDS: int = int(os.getenv('LOOP_INTERVAL_SECONDS', '300'))
+
+# List of Polymarket condition IDs (market identifiers) to monitor
+WATCHLIST: list[str] = _parse_watchlist(os.getenv('POLYMARKET_WATCHLIST'))
+
+KELLY_FRACTION = 0.25            # Fractional Kelly: use 25% of the suggested stake
+MIN_EDGE_THRESHOLD = 0.05        # Minimum edge (5%) to place a bet
+SCAN_INTERVAL_SECONDS = 300      # Slow loop cadence for Gemini AI scans (5 min)
+GEMINI_MODEL = 'gemini-2.5-flash-preview-04-17'
+POLYMARKET_HOST = os.getenv('POLYMARKET_HOST', 'https://clob.polymarket.com')
+POLYMARKET_CHAIN_ID = int(os.getenv('POLYMARKET_CHAIN_ID', '137'))  # Polygon mainnet
+
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 @dataclass
-class Candle:
-	"""Represents a single OHLCV candle."""
-	timestamp: datetime
-	open: float
-	high: float
-	low: float
-	close: float
-	volume: float
+class MarketSnapshot:
+	"""Holds the current state of a Polymarket binary market."""
+	condition_id: str
+	question: str
+	yes_price: float             # Market-implied probability for YES (0.0 – 1.0)
+	no_price: float              # Market-implied probability for NO (0.0 – 1.0)
+	news_summary: str            # External context fed to Gemini
 
 
 @dataclass
-class TechnicalSnapshot:
-	"""Aggregated TA context built from raw OHLCV data."""
-	symbol: str
-	last_price: float
-	candles: list[Candle]
-	sma_short: float
-	sma_long: float
-	rsi: float
-	news_summary: str
-
-
-@dataclass
-class TradeSignal:
-	"""Signal produced by the Gemini Hybrid Trader."""
-	symbol: str
-	action: str                   # 'BUY' | 'SELL' | 'HOLD'
-	confidence: float             # 0.0 – 1.0
-	allocation_pct: float         # Fraction of available balance to use
+class BayesianSignal:
+	"""Signal produced by the Gemini Bayesian analysis layer."""
+	condition_id: str
+	true_probability_yes: float  # Gemini's estimated true probability
+	market_implied_probability: float
+	expected_value_usd: float
+	action: str                  # 'BUY_YES' | 'BUY_NO' | 'HOLD'
 	reasoning: str
 
 
 @dataclass
-class Transaction:
-	"""Records a single simulated trade execution."""
-	timestamp: datetime
-	symbol: str
-	side: str                     # 'BUY' | 'SELL'
-	price: float
-	amount_usdt: float
-	amount_crypto: float
-	note: str = ''
+class ActiveBet:
+	"""Represents an active bet placed by the bot on a Polymarket market."""
+	condition_id: str
+	side: str                    # 'YES' or 'NO'
+	entry_price: float           # Price paid per share (0.0 – 1.0)
+	shares: float                # Number of shares purchased
+	stake_usd: float             # Total USD invested
+	order_id: str
+	placed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
-# PaperWallet — simulated balance & order execution
+# Polymarket CLOB connector
 # ---------------------------------------------------------------------------
-class PaperWallet:
+class PolymarketConnector:
 	"""
-	In-memory paper trading wallet.
-	Simulates BUY/SELL execution against live market prices
-	without placing any real orders.
+	Wraps py_clob_client to interact with the Polymarket CLOB.
+	Provides methods to fetch market data and place orders.
 	"""
 
-	def __init__(self, initial_usdt: float):
-		self._usdt: float = initial_usdt
-		self._holdings: dict[str, float] = {}   # symbol -> crypto amount
-		self._history: list[Transaction] = []
-		logger.info('PaperWallet initialised — balance: $%.2f USDT', initial_usdt)
-
-	# ------------------------------------------------------------------
-	# Public accessors
-	# ------------------------------------------------------------------
-
-	@property
-	def usdt_balance(self) -> float:
-		return self._usdt
-
-	def crypto_balance(self, symbol: str) -> float:
-		return self._holdings.get(symbol, 0.0)
-
-	@property
-	def history(self) -> list[Transaction]:
-		return list(self._history)
-
-	# ------------------------------------------------------------------
-	# Trade execution
-	# ------------------------------------------------------------------
-
-	def buy(self, symbol: str, price: float, amount_usdt: float) -> Optional[Transaction]:
-		"""
-		Buys crypto using USDT at the given price.
-		Returns the Transaction or None if insufficient funds.
-		"""
-		if amount_usdt <= 0:
-			logger.warning('PaperWallet.buy: amount_usdt must be positive.')
-			return None
-
-		if amount_usdt > self._usdt:
-			logger.warning(
-				'PaperWallet.buy: insufficient USDT (have $%.2f, need $%.2f). Capping.',
-				self._usdt, amount_usdt,
-			)
-			amount_usdt = self._usdt
-
-		if amount_usdt <= 0:
-			return None
-
-		amount_crypto = amount_usdt / price
-		self._usdt -= amount_usdt
-		self._holdings[symbol] = self._holdings.get(symbol, 0.0) + amount_crypto
-
-		tx = Transaction(
-			timestamp=datetime.now(timezone.utc),
-			symbol=symbol,
-			side='BUY',
-			price=price,
-			amount_usdt=amount_usdt,
-			amount_crypto=amount_crypto,
+	def __init__(self, private_key: str, api_key: str, api_secret: str, api_passphrase: str):
+		credentials = ApiCreds(
+			api_key=api_key,
+			api_secret=api_secret,
+			api_passphrase=api_passphrase,
 		)
-		self._history.append(tx)
+		self._client = ClobClient(
+			host=POLYMARKET_HOST,
+			chain_id=POLYMARKET_CHAIN_ID,
+			key=private_key,
+			creds=credentials,
+		)
+		logger.info('Polymarket CLOB connector initialised — host: %s', POLYMARKET_HOST)
+
+	def fetch_usdc_balance(self) -> float:
+		"""Returns the available USDC balance in the connected wallet."""
+		balance_data = self._client.get_balance()
+		return float(balance_data.get('balance', 0.0))
+
+	def fetch_market_prices(self, condition_id: str) -> dict:
+		"""
+		Fetches the best bid/ask midpoint for YES and NO tokens.
+		Returns a dict with keys 'yes_price' and 'no_price'.
+		"""
+		order_book = self._client.get_order_book(condition_id)
+		yes_price = self._extract_midpoint_price(order_book, token_side='YES')
+		no_price = round(1.0 - yes_price, 4)
+		return {'yes_price': yes_price, 'no_price': no_price}
+
+	def _extract_midpoint_price(self, order_book: dict, token_side: str) -> float:
+		"""Calculates the midpoint price from the best bid and ask."""
+		bids = order_book.get('bids', [])
+		asks = order_book.get('asks', [])
+		best_bid = float(bids[0]['price']) if bids else 0.0
+		best_ask = float(asks[0]['price']) if asks else 1.0
+		return round((best_bid + best_ask) / 2, 4)
+
+	def fetch_market_info(self, condition_id: str) -> dict:
+		"""Fetches metadata for a market, including the question text."""
+		return self._client.get_market(condition_id)
+
+	def place_market_order(self, condition_id: str, side: str, amount_usd: float) -> dict:
+		"""
+		Places a market buy order for YES or NO shares.
+		amount_usd is the total USD amount to spend.
+		"""
 		logger.info(
-			'[PAPER BUY]  %s | %.6f crypto @ $%.4f | spent $%.2f | USDT left: $%.2f',
-			symbol, amount_crypto, price, amount_usdt, self._usdt,
+			'Placing order: BUY_%s on %s for $%.2f',
+			side, condition_id, amount_usd,
 		)
-		return tx
+		order = self._client.create_market_order(
+			condition_id=condition_id,
+			outcome=side,
+			amount=amount_usd,
+		)
+		return order
 
-	def sell(self, symbol: str, price: float, amount_crypto: float) -> Optional[Transaction]:
-		"""
-		Sells crypto for USDT at the given price.
-		Returns the Transaction or None if insufficient holdings.
-		"""
-		if amount_crypto <= 0:
-			logger.warning('PaperWallet.sell: amount_crypto must be positive.')
-			return None
 
-		held = self._holdings.get(symbol, 0.0)
-		if amount_crypto > held:
-			logger.warning(
-				'PaperWallet.sell: not enough %s (have %.6f, need %.6f). Capping.',
-				symbol, held, amount_crypto,
+# ---------------------------------------------------------------------------
+# AI Bayesian signal analyzer
+# ---------------------------------------------------------------------------
+class GeminiSignalAnalyzer:
+	"""
+	Uses Google Gemini as a Bayesian Analyst to detect EV opportunities
+	in Polymarket binary prediction markets.
+	"""
+
+	def __init__(self, api_key: str):
+		self._client = genai.Client(api_key=api_key)
+		self._model_id = GEMINI_MODEL
+
+	def _build_prompt(self, snapshot: MarketSnapshot) -> str:
+		"""Builds the structured Bayesian analysis prompt for Gemini."""
+		return f"""
+You are a senior Bayesian analyst specializing in prediction market arbitrage.
+
+Your task is to analyze the following binary prediction market and determine whether the current market price represents a mispricing opportunity.
+
+MARKET QUESTION:
+"{snapshot.question}"
+
+CURRENT MARKET DATA:
+- Market-Implied Probability (YES price): {snapshot.yes_price:.4f} ({snapshot.yes_price:.1%})
+- Market-Implied Probability (NO price): {snapshot.no_price:.4f} ({snapshot.no_price:.1%})
+
+RECENT NEWS AND CONTEXT:
+{snapshot.news_summary}
+
+YOUR ANALYSIS PROCESS:
+1. Based on the news and context provided, estimate the TRUE probability that the event resolves as YES.
+2. Calculate the edge: edge = true_probability_yes - market_implied_probability
+3. Calculate the Expected Value of buying YES shares at the market price:
+   EV_yes = (true_probability_yes * (1 - yes_price)) - ((1 - true_probability_yes) * yes_price)
+4. Calculate the Expected Value of buying NO shares:
+   EV_no  = ((1 - true_probability_yes) * (1 - no_price)) - (true_probability_yes * no_price)
+5. Only recommend BUY_YES or BUY_NO if the absolute edge exceeds 5% (0.05).
+   Otherwise, recommend HOLD.
+
+EXECUTION RULES:
+- BUY_YES: if true_probability_yes > market_implied_probability AND edge > 0.05
+- BUY_NO:  if true_probability_yes < market_implied_probability AND abs(edge) > 0.05
+- HOLD:    in all other cases (insufficient edge, high uncertainty, insufficient data)
+
+Respond ONLY with a valid JSON object, no markdown, no commentary:
+{{
+  "true_probability_yes": <float between 0.0 and 1.0>,
+  "market_implied_probability": {snapshot.yes_price},
+  "expected_value_usd": <float, EV in USD per $1 staked, can be negative>,
+  "action": "BUY_YES" | "BUY_NO" | "HOLD",
+  "reasoning": "<one concise sentence explaining the key factor>"
+}}
+"""
+
+	def analyse(self, snapshot: MarketSnapshot) -> BayesianSignal:
+		"""Calls Gemini and parses the Bayesian EV signal."""
+		prompt = self._build_prompt(snapshot)
+		try:
+			response = self._client.models.generate_content(
+				model=self._model_id,
+				contents=prompt,
+				config=ai_types.GenerateContentConfig(
+					response_mime_type='application/json'
+				)
 			)
-			amount_crypto = held
 
-		if amount_crypto <= 0:
-			return None
+			raw_text = response.text.strip()
+			parsed = json.loads(raw_text)
 
-		amount_usdt = amount_crypto * price
-		self._holdings[symbol] = held - amount_crypto
-		self._usdt += amount_usdt
+			return BayesianSignal(
+				condition_id=snapshot.condition_id,
+				true_probability_yes=float(parsed.get('true_probability_yes', 0.5)),
+				market_implied_probability=float(parsed.get('market_implied_probability', snapshot.yes_price)),
+				expected_value_usd=float(parsed.get('expected_value_usd', 0.0)),
+				action=parsed.get('action', 'HOLD').upper(),
+				reasoning=parsed.get('reasoning', ''),
+			)
+		except Exception as error:
+			logger.error('Gemini API error for %s: %s', snapshot.condition_id, error)
+			return BayesianSignal(
+				condition_id=snapshot.condition_id,
+				true_probability_yes=0.5,
+				market_implied_probability=snapshot.yes_price,
+				expected_value_usd=0.0,
+				action='HOLD',
+				reasoning='API error — defaulting to HOLD',
+			)
 
-		tx = Transaction(
-			timestamp=datetime.now(timezone.utc),
-			symbol=symbol,
-			side='SELL',
-			price=price,
-			amount_usdt=amount_usdt,
-			amount_crypto=amount_crypto,
-		)
-		self._history.append(tx)
+
+# ---------------------------------------------------------------------------
+# Risk manager — Fractional Kelly Criterion
+# ---------------------------------------------------------------------------
+class RiskManager:
+	"""
+	Implements Fractional Kelly Criterion for position sizing on binary markets.
+	Formula: f = (p - p_market) / (1 - p_market)
+	Where:
+	  f        = fraction of capital to stake
+	  p        = true probability estimated by Gemini
+	  p_market = current market price (implied probability)
+	"""
+
+	def __init__(self, kelly_fraction: float = KELLY_FRACTION):
+		self._kelly_fraction = kelly_fraction
+
+	def calculate_stake(self, balance: float, signal: BayesianSignal) -> float:
+		"""
+		Computes the USD amount to bet using Fractional Kelly.
+		Returns 0.0 if the Kelly fraction is negative (no edge).
+		"""
+		p = signal.true_probability_yes
+		p_market = signal.market_implied_probability
+
+		if signal.action == 'BUY_NO':
+			# Mirror the formula for the NO side
+			p = 1.0 - signal.true_probability_yes
+			p_market = 1.0 - signal.market_implied_probability
+
+		denominator = 1.0 - p_market
+		if denominator <= 0:
+			return 0.0
+
+		full_kelly = (p - p_market) / denominator
+
+		if full_kelly <= 0:
+			logger.debug('Kelly fraction is negative (%.4f) — no edge, skipping.', full_kelly)
+			return 0.0
+
+		fractional_kelly = full_kelly * self._kelly_fraction
+		stake = balance * fractional_kelly
+
 		logger.info(
-			'[PAPER SELL] %s | %.6f crypto @ $%.4f | received $%.2f | USDT balance: $%.2f',
-			symbol, amount_crypto, price, amount_usdt, self._usdt,
+			'Kelly sizing: full_kelly=%.4f | fractional(%.0f%%)=%.4f | stake=$%.2f',
+			full_kelly, self._kelly_fraction * 100, fractional_kelly, stake,
 		)
-		return tx
+		return stake
+
+	def validate_edge(self, signal: BayesianSignal) -> bool:
+		"""Returns True if the edge is above the minimum threshold to trade."""
+		edge = abs(signal.true_probability_yes - signal.market_implied_probability)
+		if edge < MIN_EDGE_THRESHOLD:
+			logger.debug(
+				'Edge %.2f%% is below minimum threshold %.2f%% — HOLD',
+				edge * 100, MIN_EDGE_THRESHOLD * 100,
+			)
+			return False
+		return True
 
 
 # ---------------------------------------------------------------------------
-# Technical Indicator Engine (pure numpy — no TA-Lib dependency)
+# Bet manager (replaces PositionManager)
 # ---------------------------------------------------------------------------
-class IndicatorEngine:
-	"""Computes SMA and RSI from a numpy close-price array."""
-
-	@staticmethod
-	def sma(closes: np.ndarray, period: int) -> float:
-		"""Returns the most recent Simple Moving Average value."""
-		if len(closes) < period:
-			return float('nan')
-		return float(np.mean(closes[-period:]))
-
-	@staticmethod
-	def rsi(closes: np.ndarray, period: int = RSI_PERIOD) -> float:
-		"""
-		Computes RSI using Wilder's Smoothed Moving Average method.
-		Returns NaN if there are insufficient data points.
-		"""
-		if len(closes) < period + 1:
-			return float('nan')
-
-		deltas = np.diff(closes)
-		gains  = np.where(deltas > 0, deltas, 0.0)
-		losses = np.where(deltas < 0, -deltas, 0.0)
-
-		# Initial averages (simple mean for the seed window)
-		avg_gain = np.mean(gains[:period])
-		avg_loss = np.mean(losses[:period])
-
-		# Wilder's smoothing for remaining periods
-		for gain, loss in zip(gains[period:], losses[period:]):
-			avg_gain = (avg_gain * (period - 1) + gain) / period
-			avg_loss = (avg_loss * (period - 1) + loss) / period
-
-		if avg_loss == 0:
-			return 100.0
-
-		rs = avg_gain / avg_loss
-		return float(100.0 - (100.0 / (1.0 + rs)))
-
-
-# ---------------------------------------------------------------------------
-# Market Data Provider — CCXT Binance Spot (public, read-only)
-# ---------------------------------------------------------------------------
-class MarketDataProvider:
-	"""
-	Fetches public OHLCV and price data from Binance Spot
-	using CCXT in anonymous (no API key) mode.
-	"""
+class BetManager:
+	"""Maintains the in-memory registry of active bets placed by the bot."""
 
 	def __init__(self):
-		self._exchange = ccxt.binance({
-			'options': {'defaultType': 'spot'},
-		})
-		logger.info('MarketDataProvider: Binance Spot (public) initialised.')
+		self._bets: dict[str, ActiveBet] = {}
 
-	def fetch_candles(self, symbol: str, timeframe: str = CANDLE_TIMEFRAME, limit: int = CANDLE_LIMIT) -> list[Candle]:
-		"""Fetches OHLCV candles and returns them as Candle dataclass instances."""
-		try:
-			raw = self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-			candles = []
-			for row in raw:
-				ts, o, h, l, c, v = row
-				candles.append(Candle(
-					timestamp=datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
-					open=float(o),
-					high=float(h),
-					low=float(l),
-					close=float(c),
-					volume=float(v),
-				))
-			return candles
-		except Exception as error:
-			logger.error('MarketDataProvider.fetch_candles(%s): %s', symbol, error)
-			return []
+	def has_bet(self, condition_id: str) -> bool:
+		return condition_id in self._bets
 
-	def fetch_last_price(self, symbol: str) -> float:
-		"""Returns the latest ticker price for a symbol."""
-		try:
-			ticker = self._exchange.fetch_ticker(symbol)
-			return float(ticker.get('last', 0.0))
-		except Exception as error:
-			logger.error('MarketDataProvider.fetch_last_price(%s): %s', symbol, error)
-			return 0.0
+	def get_bet(self, condition_id: str) -> Optional[ActiveBet]:
+		return self._bets.get(condition_id)
+
+	def add_bet(self, bet: ActiveBet) -> None:
+		self._bets[bet.condition_id] = bet
+		logger.info(
+			'Bet placed: BUY_%s on %s | shares=%.2f | stake=$%.2f @ price=%.4f',
+			bet.side, bet.condition_id, bet.shares, bet.stake_usd, bet.entry_price,
+		)
+
+	def remove_bet(self, condition_id: str) -> None:
+		self._bets.pop(condition_id, None)
+		logger.info('Bet resolved/removed for market %s', condition_id)
+
+	def all_condition_ids(self) -> list[str]:
+		return list(self._bets.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -309,22 +367,38 @@ class NewsFetcher:
 	Designed to be resilient: a failing feed never crashes the bot.
 	"""
 
+	# Reliable public RSS feeds covering macro, crypto and prediction markets
 	_FEEDS: list[dict] = [
-		{'name': 'Yahoo Finance',    'url': 'https://finance.yahoo.com/news/rssindex'},
-		{'name': 'CoinDesk',         'url': 'https://www.coindesk.com/arc/outboundfeeds/rss/'},
-		{'name': 'Cointelegraph',    'url': 'https://cointelegraph.com/rss'},
-		{'name': 'Reuters Markets',  'url': 'https://feeds.reuters.com/reuters/businessNews'},
+		{
+			'name': 'Yahoo Finance',
+			'url': 'https://finance.yahoo.com/news/rssindex',
+		},
+		{
+			'name': 'CoinDesk',
+			'url': 'https://www.coindesk.com/arc/outboundfeeds/rss/',
+		},
+		{
+			'name': 'Cointelegraph',
+			'url': 'https://cointelegraph.com/rss',
+		},
+		{
+			'name': 'Reuters Markets',
+			'url': 'https://feeds.reuters.com/reuters/businessNews',
+		},
 	]
 
+	# Max characters per article summary to avoid flooding the Gemini context window
 	_MAX_SUMMARY_CHARS = 300
 
 	@staticmethod
 	def _clean_html(raw_text: str) -> str:
+		"""Strips HTML tags and decodes HTML entities from a raw string."""
 		without_tags = re.sub(r'<[^>]+>', '', raw_text)
 		return html.unescape(without_tags).strip()
 
 	@staticmethod
 	def _parse_published_date(entry: dict) -> datetime:
+		"""Extracts and normalises the publication date from a feed entry."""
 		tuple_date = entry.get('published_parsed') or entry.get('updated_parsed')
 		if tuple_date:
 			return datetime(*tuple_date[:6], tzinfo=timezone.utc)
@@ -332,8 +406,14 @@ class NewsFetcher:
 
 	@classmethod
 	def _fetch_single_feed(cls, feed_config: dict) -> list[dict]:
+		"""
+		Parses a single RSS feed and returns a list of article dicts.
+		Returns an empty list on any network or parse failure.
+		"""
 		try:
 			parsed = feedparser.parse(feed_config['url'])
+
+			# feedparser does not raise exceptions — check the bozo flag for errors
 			if parsed.bozo and not parsed.entries:
 				raise ValueError(parsed.bozo_exception)
 
@@ -346,356 +426,253 @@ class NewsFetcher:
 				)
 				clean_summary = cls._clean_html(raw_summary)[:cls._MAX_SUMMARY_CHARS]
 				articles.append({
-					'date':    cls._parse_published_date(entry),
-					'title':   cls._clean_html(entry.get('title', 'No title')),
+					'date': cls._parse_published_date(entry),
+					'title': cls._clean_html(entry.get('title', 'No title')),
 					'summary': clean_summary,
-					'source':  feed_config['name'],
+					'source': feed_config['name'],
 				})
 			return articles
 
 		except Exception as error:
 			logger.warning(
-				'NewsFetcher: feed "%s" failed — %s',
-				feed_config['name'], error,
+				'NewsFetcher: could not load feed "%s" (%s) — %s',
+				feed_config['name'], feed_config['url'], error,
 			)
 			return []
 
 	@classmethod
 	def get_latest_news(cls, limit: int = 10) -> str:
 		"""
-		Aggregates articles from all configured feeds, sorts them newest-first,
-		and returns a clean LLM-friendly string.
+		Aggregates articles from all configured feeds, sorts them by date
+		(newest first) and returns a clean, LLM-friendly formatted string.
+
+		Returns a fallback message if all feeds fail, so Gemini can still
+		decide to HOLD rather than crashing the bot.
 		"""
 		all_articles: list[dict] = []
 		for feed_config in cls._FEEDS:
 			all_articles.extend(cls._fetch_single_feed(feed_config))
 
 		if not all_articles:
-			logger.warning('NewsFetcher: all feeds failed — returning fallback.')
+			logger.warning('NewsFetcher: all feeds failed — returning fallback message.')
 			return 'News data currently unavailable.'
 
 		sorted_articles = sorted(all_articles, key=lambda a: a['date'], reverse=True)
-		top_articles    = sorted_articles[:limit]
+		top_articles = sorted_articles[:limit]
 
-		lines = [
-			f"[{a['date'].strftime('%Y-%m-%d %H:%M UTC')}] ({a['source']}) {a['title']}: {a['summary']}"
-			for a in top_articles
+		formatted_lines = [
+			f"[{article['date'].strftime('%Y-%m-%d %H:%M UTC')}] "
+			f"({article['source']}) {article['title']}: {article['summary']}"
+			for article in top_articles
 		]
-		return '\n'.join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Gemini Hybrid Signal Analyzer
-# ---------------------------------------------------------------------------
-class GeminiSignalAnalyzer:
-	"""
-	Uses Google Gemini as a Hybrid Spot Trader.
-	Combines technical indicators (SMA, RSI) with live news to
-	produce a structured BUY / SELL / HOLD decision.
-	"""
-
-	def __init__(self, api_key: str):
-		self._client   = genai.Client(api_key=api_key)
-		self._model_id = GEMINI_MODEL
-
-	def _format_candles(self, candles: list[Candle], last_n: int = 10) -> str:
-		"""Returns the last N candles as a readable table for the prompt."""
-		rows = []
-		for c in candles[-last_n:]:
-			rows.append(
-				f"  {c.timestamp.strftime('%m-%d %H:%M')} | "
-				f"O:{c.open:.4f}  H:{c.high:.4f}  L:{c.low:.4f}  "
-				f"C:{c.close:.4f}  V:{c.volume:.2f}"
-			)
-		return '\n'.join(rows)
-
-	def _build_prompt(self, snapshot: TechnicalSnapshot) -> str:
-		candle_table = self._format_candles(snapshot.candles)
-
-		# Trend bias derived from SMA crossover
-		if not (np.isnan(snapshot.sma_short) or np.isnan(snapshot.sma_long)):
-			trend_bias = 'BULLISH (SMA10 > SMA20)' if snapshot.sma_short > snapshot.sma_long else 'BEARISH (SMA10 < SMA20)'
-		else:
-			trend_bias = 'INSUFFICIENT DATA'
-
-		# RSI interpretation
-		if np.isnan(snapshot.rsi):
-			rsi_label = 'N/A'
-		elif snapshot.rsi >= 70:
-			rsi_label = f'{snapshot.rsi:.1f} (OVERBOUGHT)'
-		elif snapshot.rsi <= 30:
-			rsi_label = f'{snapshot.rsi:.1f} (OVERSOLD)'
-		else:
-			rsi_label = f'{snapshot.rsi:.1f} (NEUTRAL)'
-
-		return f"""You are a Senior Spot Trader executing a hybrid Technical Analysis + Fundamental Analysis strategy.
-You must look for CONFLUENCE between both signals before acting. If signals conflict, choose HOLD.
-
-=== SYMBOL: {snapshot.symbol} ===
-
---- TECHNICAL DATA ({CANDLE_TIMEFRAME} candles) ---
-Last 10 candles (Open | High | Low | Close | Volume):
-{candle_table}
-
-Current Price : ${snapshot.last_price:.4f}
-SMA-{SMA_SHORT:02d}        : {snapshot.sma_short:.4f}
-SMA-{SMA_LONG:02d}        : {snapshot.sma_long:.4f}
-Trend Bias    : {trend_bias}
-RSI-{RSI_PERIOD:02d}       : {rsi_label}
-
---- FUNDAMENTAL DATA (latest news) ---
-{snapshot.news_summary}
-
-=== CONFLUENCE RULES ===
-BUY  → RSI oversold OR SMA bullish crossover   AND news are neutral-to-bullish for this asset.
-SELL → RSI overbought OR SMA bearish crossover  AND news are neutral-to-bearish for this asset.
-HOLD → Any conflicting signals, extreme uncertainty, or insufficient data.
-
-=== OUTPUT FORMAT ===
-Respond ONLY with a valid JSON object — no markdown, no commentary:
-{{
-  "action": "BUY" | "SELL" | "HOLD",
-  "confidence": <float 0.0-1.0>,
-  "allocation_pct": <float 0.0-1.0, fraction of available balance to use; 0.0 if HOLD>,
-  "reasoning": "<one concise sentence combining TA + news rationale>"
-}}
-"""
-
-	def analyse(self, snapshot: TechnicalSnapshot) -> TradeSignal:
-		"""Calls Gemini and parses the hybrid trade signal."""
-		prompt = self._build_prompt(snapshot)
-		try:
-			response = self._client.models.generate_content(
-				model=self._model_id,
-				contents=prompt,
-				config=ai_types.GenerateContentConfig(
-					response_mime_type='application/json'
-				),
-			)
-
-			parsed = json.loads(response.text.strip())
-
-			return TradeSignal(
-				symbol=snapshot.symbol,
-				action=parsed.get('action', 'HOLD').upper(),
-				confidence=float(parsed.get('confidence', 0.0)),
-				allocation_pct=float(parsed.get('allocation_pct', 0.0)),
-				reasoning=parsed.get('reasoning', ''),
-			)
-
-		except Exception as error:
-			logger.error('Gemini API error for %s: %s', snapshot.symbol, error)
-			return TradeSignal(
-				symbol=snapshot.symbol,
-				action='HOLD',
-				confidence=0.0,
-				allocation_pct=0.0,
-				reasoning=f'API error — defaulting to HOLD ({error})',
-			)
+		return '\n'.join(formatted_lines)
 
 
 # ---------------------------------------------------------------------------
 # Console reporter
 # ---------------------------------------------------------------------------
 class ConsoleReporter:
-	"""Renders colored, human-friendly cycle reports to the terminal."""
+	"""Prints colored, human-friendly status lines to the terminal."""
 
-	def print_header(self, cycle: int) -> None:
-		ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+	def scan_start(self) -> None:
+		print(f'\n{Fore.CYAN}[SCANNING MARKETS]{Style.RESET_ALL}', flush=True)
+
+	def print_balance(self, balance: float) -> None:
+		print(f'  {Fore.YELLOW}[BALANCE]{Style.RESET_ALL} ${balance:.2f} USDC')
+
+	def print_signal(self, signal: BayesianSignal, stake: float) -> None:
+		color = Fore.GREEN if signal.action == 'BUY_YES' else Fore.RED
+		edge = abs(signal.true_probability_yes - signal.market_implied_probability)
 		print(
-			f'\n{Fore.CYAN}{"="*65}{Style.RESET_ALL}\n'
-			f'{Fore.CYAN}  📊  SPOT PAPER TRADING BOT  |  Cycle #{cycle}  |  {ts}{Style.RESET_ALL}\n'
-			f'{Fore.CYAN}{"="*65}{Style.RESET_ALL}',
-			flush=True,
+			f'  {color}[{signal.action}]{Style.RESET_ALL} '
+			f'{signal.condition_id[:12]}… | '
+			f'true_p={signal.true_probability_yes:.2%} | '
+			f'mkt_p={signal.market_implied_probability:.2%} | '
+			f'edge={edge:.2%} | EV=${signal.expected_value_usd:.4f} | '
+			f'stake=${stake:.2f}'
+			f'\n    {Fore.WHITE}reason:{Style.RESET_ALL} {signal.reasoning}'
 		)
 
-	def print_wallet(self, wallet: PaperWallet, watchlist: list[str]) -> None:
-		print(f'\n{Fore.YELLOW}  💰  PAPER WALLET{Style.RESET_ALL}')
-		print(f'     USDT Balance : ${wallet.usdt_balance:>10.2f}')
-		for symbol in watchlist:
-			crypto_bal = wallet.crypto_balance(symbol)
-			if crypto_bal > 0:
-				print(f'     {symbol:<12}: {crypto_bal:.6f}')
-
-	def print_signal(self, signal: TradeSignal, last_price: float) -> None:
-		if signal.action == 'BUY':
-			color = Fore.GREEN
-			icon  = '🟢'
-		elif signal.action == 'SELL':
-			color = Fore.RED
-			icon  = '🔴'
-		else:
-			color = Fore.WHITE
-			icon  = '⚪'
-
+	def print_hold(self, signal: BayesianSignal) -> None:
+		edge = signal.true_probability_yes - signal.market_implied_probability
 		print(
-			f'\n{color}  {icon}  [{signal.action}] {signal.symbol}{Style.RESET_ALL}'
-			f' | price=${last_price:.4f}'
-			f' | conf={signal.confidence:.0%}'
-			f' | alloc={signal.allocation_pct:.0%}'
-			f'\n     {Fore.WHITE}→{Style.RESET_ALL} {signal.reasoning}'
+			f'  {Fore.WHITE}[HOLD]{Style.RESET_ALL} '
+			f'{signal.condition_id[:12]}… | '
+			f'edge={edge:+.2%} | {signal.reasoning}'
 		)
 
-	def print_trade_executed(self, tx: Transaction) -> None:
-		color = Fore.GREEN if tx.side == 'BUY' else Fore.RED
+	def print_active_bet(self, bet: ActiveBet) -> None:
 		print(
-			f'     {color}✔ EXECUTED:{Style.RESET_ALL} {tx.side} {tx.amount_crypto:.6f} {tx.symbol}'
-			f' @ ${tx.price:.4f}  (${tx.amount_usdt:.2f} USDT)'
+			f'  {Fore.MAGENTA}[ACTIVE BET]{Style.RESET_ALL} '
+			f'BUY_{bet.side} on {bet.condition_id[:12]}… | '
+			f'stake=${bet.stake_usd:.2f} | shares={bet.shares:.2f} @ {bet.entry_price:.4f}'
 		)
 
-	def print_skipped(self, symbol: str, reason: str) -> None:
-		print(f'     {Fore.YELLOW}⚠  SKIPPED:{Style.RESET_ALL} {symbol} — {reason}')
-
-	def print_footer(self) -> None:
-		print(f'\n{Fore.CYAN}{"="*65}{Style.RESET_ALL}\n')
+	def scan_done(self) -> None:
+		print()
 
 
 # ---------------------------------------------------------------------------
-# Core bot orchestrator
+# Core bot
 # ---------------------------------------------------------------------------
-class SpotPaperTradingBot:
+class TradingBot:
 	"""
-	Orchestrates the full paper trading loop:
-	  1. Fetch OHLCV candles from Binance Spot (public).
-	  2. Compute technical indicators (SMA, RSI).
-	  3. Fetch latest news from RSS feeds.
-	  4. Send the hybrid snapshot to Gemini for a BUY/SELL/HOLD signal.
-	  5. Execute simulated trades on the PaperWallet.
-	  6. Print a detailed cycle report.
+	Orchestrates the full EV arbitrage loop:
+	  1. Fetch USDC balance
+	  2. Report active bets
+	  3. For each market in the watchlist:
+	     a. Fetch current CLOB prices
+	     b. Run Gemini Bayesian analysis with news context
+	     c. If EV is positive and edge > 5%: size via Kelly and place order
 	"""
 
 	def __init__(self):
-		initial_balance = float(os.getenv('INITIAL_PAPER_BALANCE', '1000.0'))
-		gemini_api_key  = os.getenv('GEMINI_API_KEY', '')
+		self._clob = PolymarketConnector(
+			private_key=os.getenv('POLYMARKET_PRIVATE_KEY', ''),
+			api_key=os.getenv('POLYMARKET_API_KEY', ''),
+			api_secret=os.getenv('POLYMARKET_API_SECRET', ''),
+			api_passphrase=os.getenv('POLYMARKET_API_PASSPHRASE', ''),
+		)
+		self._ai = GeminiSignalAnalyzer(api_key=os.getenv('GEMINI_API_KEY', ''))
+		self._risk = RiskManager(kelly_fraction=KELLY_FRACTION)
+		self._bets = BetManager()
+		self._reporter = ConsoleReporter()
+		self._last_scan_time = 0.0  # Force scan on first tick
 
-		self._wallet    = PaperWallet(initial_balance)
-		self._market    = MarketDataProvider()
-		self._indicators = IndicatorEngine()
-		self._ai        = GeminiSignalAnalyzer(api_key=gemini_api_key)
-		self._reporter  = ConsoleReporter()
-		self._cycle     = 0
+		initial_balance = self._clob.fetch_usdc_balance()
+		logger.info('Bot started — initial USDC balance: $%.2f', initial_balance)
 
 	# ------------------------------------------------------------------
-	# Snapshot builder
+	# Trade lifecycle helpers
 	# ------------------------------------------------------------------
 
-	def _build_snapshot(self, symbol: str, news: str) -> Optional[TechnicalSnapshot]:
-		"""Fetches candles and computes indicators, returns None on failure."""
-		candles = self._market.fetch_candles(symbol)
-		if len(candles) < SMA_LONG + 1:
-			logger.warning('Not enough candles for %s (%d returned).', symbol, len(candles))
-			return None
+	def _build_market_snapshot(self, condition_id: str) -> MarketSnapshot:
+		"""Fetches live market data and assembles a MarketSnapshot."""
+		market_info = self._clob.fetch_market_info(condition_id)
+		prices = self._clob.fetch_market_prices(condition_id)
 
-		closes = np.array([c.close for c in candles])
-		sma_short  = self._indicators.sma(closes, SMA_SHORT)
-		sma_long   = self._indicators.sma(closes, SMA_LONG)
-		rsi_value  = self._indicators.rsi(closes, RSI_PERIOD)
-		last_price = candles[-1].close
+		question = market_info.get('question', condition_id)
 
-		return TechnicalSnapshot(
-			symbol=symbol,
-			last_price=last_price,
-			candles=candles,
-			sma_short=sma_short,
-			sma_long=sma_long,
-			rsi=rsi_value,
-			news_summary=news,
+		# Aggregate global macro/crypto news from RSS feeds.
+		# NewsFetcher is resilient: returns a fallback string if all feeds fail,
+		# so Gemini can still decide to HOLD rather than crashing the bot.
+		market_description = market_info.get('description', '')
+		latest_news = NewsFetcher.get_latest_news(limit=10)
+		news_summary = (
+			f'MARKET DESCRIPTION:\n{market_description}\n\n'
+			f'LATEST MACRO/CRYPTO NEWS:\n{latest_news}'
 		)
 
-	# ------------------------------------------------------------------
-	# Trade execution
-	# ------------------------------------------------------------------
+		return MarketSnapshot(
+			condition_id=condition_id,
+			question=question,
+			yes_price=prices['yes_price'],
+			no_price=prices['no_price'],
+			news_summary=news_summary,
+		)
 
-	def _execute_signal(self, signal: TradeSignal, snapshot: TechnicalSnapshot) -> None:
-		"""Routes a BUY/SELL signal to the PaperWallet and prints the result."""
-		price = snapshot.last_price
-
-		if signal.action == 'BUY':
-			amount_usdt = self._wallet.usdt_balance * signal.allocation_pct
-			if amount_usdt < 1.0:
-				self._reporter.print_skipped(signal.symbol, f'insufficient USDT (${self._wallet.usdt_balance:.2f})')
-				return
-			tx = self._wallet.buy(signal.symbol, price, amount_usdt)
-
-		elif signal.action == 'SELL':
-			held_crypto = self._wallet.crypto_balance(signal.symbol)
-			if held_crypto <= 0:
-				self._reporter.print_skipped(signal.symbol, f'no {signal.symbol} holdings to sell')
-				return
-			amount_crypto = held_crypto * signal.allocation_pct
-			tx = self._wallet.sell(signal.symbol, price, amount_crypto)
-
-		else:
+	def _execute_bet(self, signal: BayesianSignal, balance: float) -> None:
+		"""Validates the signal, sizes via Kelly and places the order."""
+		if not self._risk.validate_edge(signal):
+			self._reporter.print_hold(signal)
 			return
 
-		if tx:
-			self._reporter.print_trade_executed(tx)
-
-	# ------------------------------------------------------------------
-	# Per-symbol pipeline
-	# ------------------------------------------------------------------
-
-	def _process_symbol(self, symbol: str, news: str) -> None:
-		"""Runs the full analysis + execution pipeline for a single symbol."""
-		snapshot = self._build_snapshot(symbol, news)
-		if snapshot is None:
-			self._reporter.print_skipped(symbol, 'insufficient market data')
+		if signal.expected_value_usd <= 0:
+			logger.info('EV is negative (%.4f) for %s — skipping.', signal.expected_value_usd, signal.condition_id)
+			self._reporter.print_hold(signal)
 			return
 
+		stake = self._risk.calculate_stake(balance, signal)
+		if stake <= 0:
+			logger.warning('Calculated stake is $0 for %s — skipping.', signal.condition_id)
+			return
+
+		# DO NOT bet more than the available balance
+		stake = min(stake, balance)
+
+		side = 'YES' if signal.action == 'BUY_YES' else 'NO'
+		price = signal.market_implied_probability if side == 'YES' else (1.0 - signal.market_implied_probability)
+
+		order = self._clob.place_market_order(signal.condition_id, side, stake)
+
+		shares = stake / price if price > 0 else 0.0
+		order_id = str(order.get('orderID') or order.get('id') or order.get('order_id') or 'unknown') if isinstance(order, dict) else str(order)
+		bet = ActiveBet(
+			condition_id=signal.condition_id,
+			side=side,
+			entry_price=price,
+			shares=shares,
+			stake_usd=stake,
+			order_id=order_id,
+		)
+		self._bets.add_bet(bet)
+		self._reporter.print_signal(signal, stake)
+
+	def _scan_market(self, condition_id: str, balance: float) -> None:
+		"""Runs the full analysis pipeline for a single market."""
+		if self._bets.has_bet(condition_id):
+			bet = self._bets.get_bet(condition_id)
+			if bet:
+				self._reporter.print_active_bet(bet)
+			return
+
+		snapshot = self._build_market_snapshot(condition_id)
 		signal = self._ai.analyse(snapshot)
 
 		logger.info(
-			'[%s] action=%s conf=%.2f alloc=%.2f | %s',
-			symbol, signal.action, signal.confidence, signal.allocation_pct, signal.reasoning,
+			'AI signal for %s → %s | true_p=%.2f%% | mkt_p=%.2f%% | EV=%.4f',
+			condition_id[:16], signal.action,
+			signal.true_probability_yes * 100,
+			signal.market_implied_probability * 100,
+			signal.expected_value_usd,
 		)
 
-		self._reporter.print_signal(signal, snapshot.last_price)
-
-		if signal.action in ('BUY', 'SELL') and signal.confidence >= MIN_CONFIDENCE:
-			self._execute_signal(signal, snapshot)
-		elif signal.action in ('BUY', 'SELL'):
-			self._reporter.print_skipped(
-				symbol,
-				f'confidence {signal.confidence:.0%} below threshold {MIN_CONFIDENCE:.0%}',
-			)
+		if signal.action in ('BUY_YES', 'BUY_NO'):
+			self._execute_bet(signal, balance)
+		else:
+			self._reporter.print_hold(signal)
 
 	# ------------------------------------------------------------------
 	# Main loop
 	# ------------------------------------------------------------------
 
 	def run(self) -> None:
-		"""Starts the continuous paper trading loop."""
-		logger.info('=== Spot Paper Trading Bot started ===')
-		logger.info('Watchlist: %s | Interval: %ds', WATCHLIST, LOOP_INTERVAL_SECONDS)
+		"""Starts the EV arbitrage scanning loop."""
+		logger.info('=== Polymarket EV Bot started ===')
+
+		if not WATCHLIST:
+			logger.error(
+				'WATCHLIST is empty. Add Polymarket condition IDs to POLYMARKET_WATCHLIST in .env'
+			)
+			return
 
 		while True:
 			try:
-				self._cycle += 1
-				self._reporter.print_header(self._cycle)
-				self._reporter.print_wallet(self._wallet, WATCHLIST)
+				current_time = time.time()
+				is_scan_time = (current_time - self._last_scan_time) >= SCAN_INTERVAL_SECONDS
 
-				# Fetch news once per cycle — shared across all symbols
-				news = NewsFetcher.get_latest_news(limit=10)
+				if is_scan_time:
+					balance = self._clob.fetch_usdc_balance()
+					self._reporter.print_balance(balance)
+					self._reporter.scan_start()
 
-				print(f'\n{Fore.CYAN}  📡  ANALYZING MARKETS ...{Style.RESET_ALL}')
-				for symbol in WATCHLIST:
-					self._process_symbol(symbol, news)
+					for condition_id in WATCHLIST:
+						self._scan_market(condition_id, balance)
 
-				self._reporter.print_footer()
+					self._reporter.scan_done()
+					self._last_scan_time = time.time()
 
-			except KeyboardInterrupt:
-				logger.info('Bot stopped by user.')
-				break
+			except ConnectionError as error:
+				logger.error('Network error: %s — retrying in %ds', error, SCAN_INTERVAL_SECONDS)
 			except Exception as error:
-				logger.exception('Unexpected error in main loop: %s', error)
+				logger.exception('Unexpected error: %s', error)
 
-			logger.info('Sleeping %ds until next cycle...', LOOP_INTERVAL_SECONDS)
-			time.sleep(LOOP_INTERVAL_SECONDS)
+			time.sleep(SCAN_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
-	bot = SpotPaperTradingBot()
+	bot = TradingBot()
 	bot.run()
